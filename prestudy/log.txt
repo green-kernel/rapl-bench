@@ -1,0 +1,25 @@
+Log Date: 10-sep-2024
+Log By:	Maja H Kirkeby
+
+This data was collected on 9 X260 machines of the same model. 
+The room was not temperature controlled.
+
+On each machine ID we collected the MSR update using the c-file as follows:
+1. we executed the collector script (this was done by hand and the amount of observations differ) and >> the content into a file names "out_"+ID+"_no_load.csv". We stopped the measurements using ctrl+c
+2. we started the stress-command "stress -ng -c 1" and afterwards, I started the collector script. 
+
+There are many sources for variations:
+procedure:
+- difference in sampling time => large differences in number of samples per computer
+- difference in time between the stress-command and the collector command
+
+environment:
+- difference in CPU load for "0" load
+- temperature is not controlled and not logged
+
+Suggested Improvements for the collector script: 
+- when a usec increase, the time_diff is a negative number
+- add logging of CPU temperature (mainly for verification reasons). If this affects the update rate, we can log when start+end collection
+- add logging of CPU utilization to verify the actual utilization
+- add logging of current frequency 
+- create a wrapper script for starting+ending sampling to ensure , controlling CPU loads, 
