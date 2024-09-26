@@ -24,6 +24,7 @@
 /* Vince Weaver -- vincent.weaver @ maine.edu -- 11 September 2015    */
 /*                                    */
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/types.h>
@@ -36,6 +37,7 @@
 #include <string.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <stdbool.h>
 
 
 /* AMD Support */
@@ -113,7 +115,7 @@ static int open_msr(int core) {
     return fd;
 }
 
-static long long read_msr(int fd, unsigned int which) {
+static uint64_t read_msr(int fd, unsigned int which) {
 
     uint64_t data;
 
@@ -123,7 +125,7 @@ static long long read_msr(int fd, unsigned int which) {
         exit(127);
     }
 
-    return (long long)data;
+    return data;
 }
 
 #define CPU_VENDOR_INTEL    1
@@ -166,7 +168,7 @@ static long long read_msr(int fd, unsigned int which) {
 // TODO: If this code ever gets multi-threaded please review this assumption to
 // not pollute another threads state
 static unsigned int msr_rapl_units,msr_pkg_energy_status,msr_pp0_energy_status;
-static unsigned int msleep_time=1000;
+static unsigned int usleep_time=1000;
 
 static int detect_cpu(void) {
 
@@ -237,7 +239,7 @@ static int detect_cpu(void) {
 #define MAX_CPUS    1024
 #define MAX_PACKAGES    16
 
-static int total_cores=0,total_packages=0;
+static size_t total_cores=0,total_packages=0;
 static int package_map[MAX_PACKAGES];
 
 static int detect_packages(void) {
@@ -274,6 +276,7 @@ static int detect_packages(void) {
 int dram_avail=0;
 int different_units=0;
 double cpu_energy_units[MAX_PACKAGES],dram_energy_units[MAX_PACKAGES];
+uint32_t raw_energy_status_units;
 unsigned int energy_status;
 double energy_units[MAX_PACKAGES];
 
@@ -371,7 +374,8 @@ static int setup_measurement_units(int measurement_mode) {
         //power_units=pow(0.5,(double)(result&0xf)); //multiplying by 0xf will give you the first 4 bits
         //time_units=pow(0.5,(double)((result>>16)&0xf));
 
-        cpu_energy_units[j]=pow(0.5,(double)((result>>8)&0x1f)); //multiplying by 0x1f will give you the first 5 bits
+        raw_energy_status_units = (result>>8) & 0x1f; // Extract bits 12:8
+        cpu_energy_units[j]=pow(0.5,(double)raw_energy_status_units);
 
         if(measurement_mode == MEASURE_DRAM && different_units) {
             dram_energy_units[j]=pow(0.5,(double)16);
@@ -421,79 +425,52 @@ static int check_system() {
 
 }
 
-struct timeval before;
-
-static int rapl_msr(int measurement_mode) {
-    int fd;
-    long long result;
-    double package_before[MAX_PACKAGES],package_after[MAX_PACKAGES];
-    int j;
+static void dump_rapl(int measurement_mode) {
+    int fd[total_packages];
     struct timeval now;
+    uint64_t result[total_packages];
 
-    for(j=0;j<total_packages;j++) {
-
-        fd=open_msr(package_map[j]);
-        /* Package Energy */
-
-        result=read_msr(fd,energy_status);
-        /*
-        if(result<0){
-            fprintf(stderr,"Negative Energy Reading: %lld\n", result);
-            exit(-1);
-        }*/
-        package_before[j]=(double)result*energy_units[j];
-        close(fd);
+    // Open MSRs for all packages
+    for (size_t i = 0;i < total_packages;i++) {
+        fd[i] = open_msr(package_map[i]);
     }
 
-    //usleep(msleep_time);
+    // Emit CSV header
+    char *mode_name;
+    switch (measurement_mode) {
+        // Mode names are taken from this intel manual
+        // https://www.intel.com/content/dam/develop/external/us/en/documents/335592-sdm-vol-4.pdf
+        case MEASURE_ENERGY_PKG:
+            mode_name = "pkg_energy_status";
+            break;
+        case MEASURE_DRAM:
+            mode_name = "dram_energy_status";
+            break;
+        case MEASURE_PSYS:
+            mode_name = "platform_energy_counter";
+            break;
+    }
+    printf("package;timestamp_sec;timestamp_usec;%s,energy_status_unit\n", mode_name);
 
-    for(j=0;j<total_packages;j++) {
-        fd=open_msr(package_map[j]);
-
-
-        double energy_output = 0.0;
-        result=read_msr(fd,energy_status);
-
-        // As we are reading the MSR as an unsigned int, so the reading should never be negative
-        // However, in case it does somehow, we still don't want it to abort
-        /*
-        if(result<0){
-            fprintf(stderr,"Negative Energy Reading: %lld\n", result);
-            exit(-1);
-        }*/
-        package_after[j]=(double)result*energy_units[j];
-        energy_output = package_after[j]-package_before[j];
-
-        // The register can overflow at some point, leading to the subtraction giving an incorrect value (negative)
-        // For now, skip reporting this value. in the future, we can use a branchless alternative
-        if(energy_output> 0) {
-
-            gettimeofday(&now, NULL);
-
-            suseconds_t div_time = now.tv_usec - before.tv_usec;
-
-            before = now;
-
-            if (measurement_mode == MEASURE_ENERGY_PKG) {
-                //printf("%06ld %f Package_%d\n", div_time, energy_output, j);
-                printf("%ld %06ld %04ld %f Package_%d\n", now.tv_sec, now.tv_usec, div_time, energy_output, j);
-
-            } else if (measurement_mode == MEASURE_DRAM) {
-                printf("%ld%06ld %ld DRAM_%d\n", now.tv_sec, now.tv_usec, (long int)(energy_output*1000), j);
-            } else if (measurement_mode == MEASURE_PSYS) {
-                printf("%ld%06ld %ld PSYS_%d\n", now.tv_sec, now.tv_usec, (long int)(energy_output*1000), j);
-            }
+    // Continuously read rapl values and dump them to csv
+    while (true) {
+        // First read out all time critical values while doing as little other stuff as possible
+        for (size_t i = 0;i < total_packages;i++) {
+            result[i] = read_msr(fd[i], energy_status);
+            // TODO The code currently assumes that the energy_units cannot change.
+            // Is this assumption correct or should we read energy_units in every cycle?
         }
-        /*
-        else {
-            fprintf(stderr, "Energy reading had unexpected value: %f", energy_output);
-            exit(-1);
-        }*/
+        gettimeofday(&now, NULL);
 
-        close(fd);
+        // After all values have been read, initiate "slow" output process
+        for (size_t i = 0;i < total_packages;i++) {
+            printf("%ld;%ld;%ld;%ld;%d\n", i, now.tv_sec, now.tv_usec, result[i], raw_energy_status_units);
+        }
+
+        if (usleep_time > 0) {
+            usleep(usleep_time);
+        }
     }
-
-    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -514,7 +491,7 @@ int main(int argc, char **argv) {
             printf("\t-c      : check system and exit\n");
             exit(0);
         case 'i':
-            msleep_time = atoi(optarg);
+            usleep_time = atoi(optarg);
             break;
         case 'd':
             measurement_mode=MEASURE_DRAM;
@@ -544,7 +521,7 @@ int main(int argc, char **argv) {
     }
 
     while(1) {
-        rapl_msr(measurement_mode);
+        dump_rapl(measurement_mode);
     }
 
     return 0;
