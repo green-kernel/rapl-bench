@@ -520,9 +520,7 @@ int main(int argc, char **argv) {
         exit(check_system());
     }
 
-    while(1) {
-        dump_rapl(measurement_mode);
-    }
+    dump_rapl(measurement_mode);
 
     return 0;
 }
